@@ -35,6 +35,8 @@ class TushareClient:
                 return result
             except Exception as exc:  # noqa: BLE001 - surface Tushare error after retries
                 last_error = exc
+                if "没有接口" in str(exc) or "访问权限" in str(exc):
+                    break
                 if attempt >= self._retry_times:
                     break
                 sleep_seconds = self._backoff_seconds * attempt
