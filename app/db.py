@@ -63,7 +63,7 @@ def upsert_dataframe(
         return 0
 
     unique_set = set(unique_columns)
-    clean_df = df.where(pd.notnull(df), None)
+    clean_df = df.astype(object).where(pd.notnull(df), None)
     rows = clean_df.to_dict(orient="records")
 
     metadata = MetaData()

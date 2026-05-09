@@ -11,9 +11,20 @@ from sqlalchemy.engine import Engine
 
 from app.config import Settings
 from app.db import read_stock_codes, read_trade_dates, upsert_dataframe
+from app.providers import FallbackProvider
 from app.tushare_client import TushareClient
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_INDEX_CODES = (
+    "000001.SH",
+    "399001.SZ",
+    "399006.SZ",
+    "000300.SH",
+    "000905.SH",
+    "000852.SH",
+    "000688.SH",
+)
 
 
 SyncFunction = Callable[["SyncContext", "Dataset", str, str, str | None], tuple[int, int]]
@@ -34,6 +45,8 @@ class SyncContext:
     client: TushareClient
     engine: Engine
     settings: Settings
+    fallback_provider: FallbackProvider | None = None
+    enable_fallback: bool = True
 
 
 def today_yyyymmdd() -> str:
@@ -60,6 +73,23 @@ def open_trade_days_or_calendar(engine: Engine, start_date: str, end_date: str) 
     if trade_dates:
         return trade_dates
     return calendar_days(start_date, end_date)
+
+
+def should_fallback(exc: Exception) -> bool:
+    error_text = str(exc)
+    return any(
+        marker in error_text
+        for marker in (
+            "Tushare query failed",
+            "没有接口",
+            "访问权限",
+            "无权限",
+            "permission",
+            "timeout",
+            "timed out",
+            "Connection",
+        )
+    )
 
 
 def insert_sync_run(
@@ -130,6 +160,19 @@ def upsert(ctx: SyncContext, dataset: Dataset, frame: pd.DataFrame) -> int:
     )
 
 
+def upsert_with_source_log(ctx: SyncContext, dataset: Dataset, frame: pd.DataFrame, source: str, reason: str) -> int:
+    affected = upsert(ctx, dataset, frame)
+    logger.info(
+        "%s fallback source=%s reason=%s fetched=%s affected=%s",
+        dataset.name,
+        source,
+        reason,
+        len(frame),
+        affected,
+    )
+    return affected
+
+
 def sync_single_call(ctx: SyncContext, dataset: Dataset, start_date: str, end_date: str, ts_code: str | None) -> tuple[int, int]:
     params = dict(dataset.default_params or {})
     if ts_code:
@@ -147,8 +190,57 @@ def sync_by_trade_date(ctx: SyncContext, dataset: Dataset, start_date: str, end_
     params = dict(dataset.default_params or {})
     if ts_code:
         params["ts_code"] = ts_code
+    stock_codes: list[str] | None = None
     for trade_date in open_trade_days_or_calendar(ctx.engine, start_date, end_date):
-        frame = ctx.client.query(dataset.api_name, trade_date=trade_date, **params)
+        try:
+            frame = ctx.client.query(dataset.api_name, trade_date=trade_date, **params)
+        except Exception as exc:
+            if dataset.name not in ("daily", "index_daily") or not ctx.enable_fallback or ctx.fallback_provider is None or not should_fallback(exc):
+                raise
+            if dataset.name == "daily" and stock_codes is None:
+                stock_codes = read_stock_codes(ctx.engine)
+            if dataset.name == "daily":
+                fallback = ctx.fallback_provider.fetch_daily_by_trade_date(
+                    trade_date=trade_date,
+                    ts_code=ts_code,
+                    stock_codes=stock_codes or [],
+                    reason=str(exc),
+                )
+            else:
+                fallback = ctx.fallback_provider.fetch_index_daily_by_trade_date(
+                    trade_date=trade_date,
+                    ts_code=ts_code,
+                    index_codes=list(DEFAULT_INDEX_CODES),
+                    reason=str(exc),
+                )
+            frame = fallback.frame
+            fetched += len(frame)
+            affected += upsert_with_source_log(ctx, dataset, frame, fallback.source, fallback.reason)
+            logger.info("%s %s fetched=%s affected_total=%s", dataset.name, trade_date, len(frame), affected)
+            continue
+        if frame.empty and dataset.name in ("daily", "index_daily") and ctx.enable_fallback and ctx.fallback_provider is not None:
+            if dataset.name == "daily" and stock_codes is None:
+                stock_codes = read_stock_codes(ctx.engine)
+            if dataset.name == "daily":
+                fallback = ctx.fallback_provider.fetch_daily_by_trade_date(
+                    trade_date=trade_date,
+                    ts_code=ts_code,
+                    stock_codes=stock_codes or [],
+                    reason="tushare_empty",
+                )
+            else:
+                fallback = ctx.fallback_provider.fetch_index_daily_by_trade_date(
+                    trade_date=trade_date,
+                    ts_code=ts_code,
+                    index_codes=list(DEFAULT_INDEX_CODES),
+                    reason="tushare_empty",
+                )
+            if not fallback.frame.empty:
+                frame = fallback.frame
+                fetched += len(frame)
+                affected += upsert_with_source_log(ctx, dataset, frame, fallback.source, fallback.reason)
+                logger.info("%s %s fetched=%s affected_total=%s", dataset.name, trade_date, len(frame), affected)
+                continue
         fetched += len(frame)
         affected += upsert(ctx, dataset, frame)
         logger.info("%s %s fetched=%s affected=%s", dataset.name, trade_date, len(frame), affected)
@@ -173,7 +265,16 @@ def sync_by_stock(ctx: SyncContext, dataset: Dataset, start_date: str, end_date:
 
 def sync_trade_cal(ctx: SyncContext, dataset: Dataset, start_date: str, end_date: str, ts_code: str | None) -> tuple[int, int]:
     del ts_code
-    frame = ctx.client.query("trade_cal", exchange="SSE", start_date=start_date, end_date=end_date)
+    try:
+        frame = ctx.client.query("trade_cal", exchange="SSE", start_date=start_date, end_date=end_date)
+    except Exception as exc:
+        if not ctx.enable_fallback or ctx.fallback_provider is None or not should_fallback(exc):
+            raise
+        fallback = ctx.fallback_provider.fetch_trade_cal(start_date, end_date, str(exc))
+        return len(fallback.frame), upsert_with_source_log(ctx, dataset, fallback.frame, fallback.source, fallback.reason)
+    if frame.empty and ctx.enable_fallback and ctx.fallback_provider is not None:
+        fallback = ctx.fallback_provider.fetch_trade_cal(start_date, end_date, "tushare_empty")
+        return len(fallback.frame), upsert_with_source_log(ctx, dataset, fallback.frame, fallback.source, fallback.reason)
     return len(frame), upsert(ctx, dataset, frame)
 
 

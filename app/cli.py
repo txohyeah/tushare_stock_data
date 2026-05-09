@@ -7,6 +7,7 @@ import typer
 
 from app.config import get_settings
 from app.db import create_db_engine, init_schema
+from app.providers import FallbackProvider
 from app.sync.base import SyncContext, lookback_start, run_many, today_yyyymmdd
 from app.sync.registry import DATASETS, datasets_for
 from app.tushare_client import TushareClient
@@ -17,11 +18,19 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logger = logging.getLogger(__name__)
 
 
-def build_context() -> SyncContext:
+def build_context(enable_fallback: bool | None = None) -> SyncContext:
     settings = get_settings()
     engine = create_db_engine(settings)
     client = TushareClient(settings)
-    return SyncContext(client=client, engine=engine, settings=settings)
+    fallback_enabled = settings.enable_fallback if enable_fallback is None else enable_fallback
+    fallback_provider = FallbackProvider(settings) if fallback_enabled else None
+    return SyncContext(
+        client=client,
+        engine=engine,
+        settings=settings,
+        fallback_provider=fallback_provider,
+        enable_fallback=fallback_enabled,
+    )
 
 
 @app.command("init-db")
@@ -50,9 +59,10 @@ def sync(
     end_date: Optional[str] = typer.Option(None, "--end", help="End date, YYYYMMDD."),
     ts_code: Optional[str] = typer.Option(None, "--ts-code", help="Single stock/index code."),
     history: bool = typer.Option(False, "--history", help="Mark this run as historical backfill."),
+    fallback: Optional[bool] = typer.Option(None, "--fallback/--no-fallback", help="Enable fallback data sources."),
 ) -> None:
     """Sync one dataset or a dataset group."""
-    ctx = build_context()
+    ctx = build_context(fallback)
     init_schema(ctx.engine)
 
     end = end_date or today_yyyymmdd()
@@ -60,7 +70,14 @@ def sync(
     mode = "history" if history else "daily"
 
     selected = datasets_for(dataset)
-    logger.info("Sync start dataset=%s start=%s end=%s mode=%s", dataset, start, end, mode)
+    logger.info(
+        "Sync start dataset=%s start=%s end=%s mode=%s fallback=%s",
+        dataset,
+        start,
+        end,
+        mode,
+        ctx.enable_fallback,
+    )
     results = run_many(ctx, selected, start, end, mode, ts_code)
     for name, (fetched, affected) in results.items():
         typer.echo(f"{name}: fetched={fetched}, affected={affected}")

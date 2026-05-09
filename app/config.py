@@ -38,6 +38,13 @@ def _float_env(name: str, default: float) -> float:
     return float(value)
 
 
+def _bool_env(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
 @dataclass(frozen=True)
 class Settings:
     tushare_token: str
@@ -53,6 +60,12 @@ class Settings:
     sync_retry_backoff_seconds: float
     sync_request_interval_seconds: float
     sync_lookback_days: int
+    enable_fallback: bool
+    crawler_sleep_min_seconds: float
+    crawler_sleep_max_seconds: float
+    crawler_max_retries: int
+    crawler_cooldown_seconds: float
+    crawler_timeout_seconds: float
 
     @property
     def mysql_url(self) -> str:
@@ -78,4 +91,10 @@ def get_settings() -> Settings:
         sync_retry_backoff_seconds=_float_env("SYNC_RETRY_BACKOFF_SECONDS", 2),
         sync_request_interval_seconds=_float_env("SYNC_REQUEST_INTERVAL_SECONDS", 0.35),
         sync_lookback_days=_int_env("SYNC_LOOKBACK_DAYS", 5),
+        enable_fallback=_bool_env("ENABLE_FALLBACK", True),
+        crawler_sleep_min_seconds=_float_env("CRAWLER_SLEEP_MIN_SECONDS", 1.5),
+        crawler_sleep_max_seconds=_float_env("CRAWLER_SLEEP_MAX_SECONDS", 3.0),
+        crawler_max_retries=_int_env("CRAWLER_MAX_RETRIES", 3),
+        crawler_cooldown_seconds=_float_env("CRAWLER_COOLDOWN_SECONDS", 300),
+        crawler_timeout_seconds=_float_env("CRAWLER_TIMEOUT_SECONDS", 20),
     )

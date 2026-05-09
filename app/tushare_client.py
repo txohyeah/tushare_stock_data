@@ -35,7 +35,8 @@ class TushareClient:
                 return result
             except Exception as exc:  # noqa: BLE001 - surface Tushare error after retries
                 last_error = exc
-                if "没有接口" in str(exc) or "访问权限" in str(exc):
+                error_text = str(exc)
+                if any(marker in error_text for marker in ("没有接口", "访问权限", "无权限", "permission")):
                     break
                 if attempt >= self._retry_times:
                     break
@@ -49,4 +50,5 @@ class TushareClient:
                     sleep_seconds,
                 )
                 time.sleep(sleep_seconds)
-        raise RuntimeError(f"Tushare query failed: {api_name}") from last_error
+        detail = f": {last_error}" if last_error else ""
+        raise RuntimeError(f"Tushare query failed: {api_name}{detail}") from last_error
